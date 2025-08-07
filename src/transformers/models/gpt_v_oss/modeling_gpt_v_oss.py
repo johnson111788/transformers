@@ -10,7 +10,7 @@ from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPas
 from ...modeling_utils import PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
-from ..auto import AutoModel
+from ..auto import AutoModel, AutoModelForCausalLM
 from .configuration_gpt_v_oss import GptVOssConfig
 
 
@@ -39,20 +39,23 @@ class GptVOssModel(GptVOssPreTrainedModel):
         super().__init__(config)
         self.vision_language_model = AutoModel.from_config(config.internvl_config)
         self.projector = GptVOssProjector(config)
-        self.language_model = AutoModel.from_config(config.text_config)
+        self.oss_language_model = AutoModel.from_config(config.text_config)
+        # hardy: for weight merging only
+        # self.oss_language_model = AutoModelForCausalLM.from_config(config.text_config)
+
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.language_model.get_input_embeddings()
+        return self.oss_language_model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        self.language_model.set_input_embeddings(value)
+        self.oss_language_model.set_input_embeddings(value)
 
     def set_decoder(self, decoder):
-        self.language_model = decoder
+        self.oss_language_model = decoder
 
     def get_decoder(self):
-        return self.language_model
+        return self.oss_language_model
 
     @can_return_tuple
     @auto_docstring
@@ -78,7 +81,7 @@ class GptVOssModel(GptVOssPreTrainedModel):
             **kwargs,
         )
         hidden_states = self.projector(vision_outputs.last_hidden_state)
-        outputs = self.language_model(
+        outputs = self.oss_language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
