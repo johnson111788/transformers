@@ -192,6 +192,7 @@ TEST_FILES_WITH_NO_COMMON_TESTS = [
     "models/shieldgemma2/test_modeling_shieldgemma2.py",
     "models/llama4/test_modeling_llama4.py",
     "models/gpt_v_oss/test_modeling_gpt_v_oss.py",
+    "models/gpt_v_oss2/test_modeling_gpt_v_oss2.py",
 ]
 
 # Update this list for models that are not in any of the auto MODEL_XXX_MAPPING. Being in this list is an exception and

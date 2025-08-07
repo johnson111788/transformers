@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     from .gpt_oss import *
     from .gpt_sw3 import *
     from .gpt_v_oss import *
+    from .gpt_v_oss2 import *
     from .gptj import *
     from .granite import *
     from .granite_speech import *
