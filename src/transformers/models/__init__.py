@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     from .gpt_neox_japanese import *
     from .gpt_oss import *
     from .gpt_sw3 import *
+    from .gpt_v_oss import *
     from .gptj import *
     from .granite import *
     from .granite_speech import *
