@@ -33,11 +33,13 @@ class GptVOss2PreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
 
+from torch.nn.utils.rnn import pad_sequence
+
+
 
 class GptVOss2Model(GptVOss2PreTrainedModel):
     def __init__(self, config: GptVOss2Config):
         super().__init__(config)
-        # import ipdb;ipdb.set_trace()
         self.vision_language_model = AutoModel.from_config(config.internvl_config)
         self.projector = GptVOss2Projector(config)
         self.oss_language_model = AutoModel.from_config(config.text_config)
@@ -57,6 +59,135 @@ class GptVOss2Model(GptVOss2PreTrainedModel):
 
     def get_decoder(self):
         return self.oss_language_model
+    
+    def get_vision_language_tokenizer(self):
+        return self.vision_language_tokenizer
+    
+    def get_language_tokenizer(self):
+        return self.language_tokenizer
+    
+    def get_tokenizer(self):
+        return self.tokenizer
+
+
+    def masked_select_and_pad(self, input_ids: torch.Tensor,
+                            mask: torch.Tensor,
+                            padding_value: int = 0):
+        """
+        Args
+        ----
+        input_ids : LongTensor of shape (bsz, seqlen)
+        mask      : same shape, 0/1 or bool
+        padding_value : what to right-pad with
+
+        Returns
+        -------
+        padded_ids      : LongTensor (bsz, max_len)
+        new_attn_mask   : LongTensor (bsz, max_len) — 1 for real tokens, 0 for pad
+        """
+        # keep only the tokens the mask says are “on”
+        kept = [row_ids[row_mask.bool()]          # 1-D tensor, variable length
+                for row_ids, row_mask in zip(input_ids, mask)]
+
+
+        # right-pad to the longest sequence in the batch
+        padded_ids = pad_sequence(
+            kept, batch_first=True, padding_value=padding_value
+        )
+
+        # attention mask: 1 where not pad, 0 where pad
+        new_attn_mask = (padded_ids != padding_value).long()
+
+        return padded_ids, new_attn_mask
+    
+    def unpad_tensor(self, padded: torch.Tensor,
+                    attn_mask: torch.Tensor):
+        """
+        Args
+        ----
+        padded      : Tensor (bsz, seqlen, dim)  – the right-padded batch
+        attn_mask   : Tensor (bsz, seqlen)       – 1 for real tokens, 0 for pad
+
+        Returns
+        -------
+        list_of_tensors : length == bsz
+            Each element i has shape (valid_len_i, dim), where
+            valid_len_i == attn_mask[i].sum().
+        """
+        # Ensure boolean mask
+        attn_mask_bool = attn_mask.bool()
+
+        # Split row-by-row, selecting un-padded positions
+        unpadded = [
+            row[mask_row]           # keeps only the “real” time-steps
+            for row, mask_row in zip(padded, attn_mask_bool)
+        ]
+
+        return unpadded
+
+
+    def reverse_and_gather_vision_tokens(self, input_ids: torch.LongTensor):
+
+        vision_keys = ['start_image_token', 'end_image_token', 'context_image_token', 'video_token']
+        processed_ids = input_ids.clone()
+        for vk in vision_keys:
+            vk_id = self.get_tokenizer().convert_tokens_to_ids(getattr(self.get_tokenizer(), vk))
+            # old id
+            vk_vl_id = self.get_vision_language_tokenizer().convert_tokens_to_ids(getattr(self.get_vision_language_tokenizer(), vk)) 
+            # get mask
+            _mask = input_ids == vk_id
+            # replace with old id
+            processed_ids = processed_ids.masked_fill(_mask, vk_vl_id) 
+
+        vision_mask = input_ids!=processed_ids
+        processed_ids, new_mask = self.masked_select_and_pad(processed_ids, vision_mask, self.get_vision_language_tokenizer().pad_token_id)
+
+        return processed_ids, new_mask, vision_mask
+    
+
+    def scatter_sources_into_target(self, sources: list[torch.Tensor],          # list of 1-D tensors / lists
+                                    target: torch.Tensor,
+                                    mask:   torch.Tensor):
+        """
+        Fills `target` where `mask == 1` with the corresponding values from `sources`.
+
+        Args
+        ----
+        sources : list[Tensor] / list[list[int]]  (len == bsz)
+                len(sources[i]) must equal (mask[i] == 1).sum()
+        target  : Tensor  (bsz, seqlen)
+        mask    : Tensor  (bsz, seqlen) – 1 → position to replace, 0 → keep
+
+        Returns
+        -------
+        Tensor (bsz, seqlen) – same shape as `target`, but with scattered values.
+        """
+        out = target.clone()
+
+        for row_idx, (row_src, row_mask) in enumerate(zip(sources, mask)):
+            insert_pos = row_mask.bool()              # 1 → True, 0 → False
+            if insert_pos.sum().item() != len(row_src):
+                raise ValueError(f"Row {row_idx}: mask wants "
+                                f"{insert_pos.sum().item()} values but source has "
+                                f"{len(row_src)}")
+            out[row_idx, insert_pos] = torch.as_tensor(
+                row_src, dtype=target.dtype, device=target.device
+            )
+
+        return out
+    # def reverse_vision_ids(self, input_ids: torch.LongTensor):
+    #     vision_keys = ['start_image_token', 'end_image_token', 'context_image_token', 'video_token']
+    #     new_ids = input_ids.clone()
+    #     for vk in vision_keys:
+    #         vk_id = self.get_tokenizer().convert_tokens_to_ids(getattr(self.get_tokenizer(), vk))
+    #         # old id
+    #         vk_vl_id = self.get_tokenizer().convert_tokens_to_ids(getattr(self.get_vision_language_tokenizer(), vk)) 
+    #         # get mask
+    #         _mask = new_ids == vk_id
+    #         # replace with the old id
+    #         new_ids = new_ids.masked_fill(_mask, vk_vl_id) 
+
+    #     return new_ids
 
     @can_return_tuple
     @auto_docstring
@@ -74,36 +205,43 @@ class GptVOss2Model(GptVOss2PreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, MoeModelOutputWithPast]:
-        # TODO: input_ids -> OSS de-tokenizer -> text -> InternVL tokenize -> internvl ids
+    ) -> Union[tuple, MoeModelOutputWithPast]:        
+        # replace image tokens in input_ids with lang_token
+        input_ids_for_vl_model, attention_mask_for_vl_model, vision_mask = self.reverse_and_gather_vision_tokens(input_ids)
         
-        
-        import ipdb;ipdb.set_trace()
         # image only
         vision_outputs = self.vision_language_model(
-            input_ids=input_ids_extra,
+            input_ids=input_ids_for_vl_model,
             pixel_values=pixel_values,
-            attention_mask=attention_mask, # all ones
+            attention_mask=attention_mask_for_vl_model, # all ones
             **kwargs,
         )
-        hidden_states = self.projector(vision_outputs.last_hidden_state)
-        print(f'this is gptossv2')
 
-        # from input_ids: <system> <N_image_tokens> <other_texts>
-        # from hidden_states: N_images_emb
+        # this is a padded tensor!
+        vision_feature = self.projector(vision_outputs.last_hidden_state)
+        # unpadded list[tensor]
+        vision_feature_unpadded_lst = self.unpad_tensor(vision_feature, attention_mask_for_vl_model)
+        
+        # get oss emb
+        input_embeds = self.get_input_embeddings()(input_ids)
+        
+        # scatter image feature to input_embeddings
+        hidden_states = self.scatter_sources_into_target(
+            sources=vision_feature_unpadded_lst,
+            target=input_embeds,
+            mask=vision_mask
+        )
 
-        # todo: 
-        # hidden_states = oss.get_embedding(input_ids)
-        # scatter <N_images_emb> to hidden_states, mask=(input_ids==image_token_id)
+        # forward language model
         outputs = self.oss_language_model(
-            attention_mask=attention_mask, # all ones
-            position_ids=position_ids, # None
-            past_key_values=past_key_values, # None
+            attention_mask=attention_mask,
+            position_ids=position_ids, 
+            past_key_values=past_key_values,
             inputs_embeds=hidden_states,
-            use_cache=use_cache, # None
-            output_attentions=output_attentions, # None
-            output_hidden_states=output_hidden_states, # None
-            return_dict=return_dict, # None
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
             cache_position=cache_position,
             **kwargs,
         )
