@@ -39,9 +39,11 @@ class GptVOssModel(GptVOssPreTrainedModel):
         super().__init__(config)
         self.vision_language_model = AutoModel.from_config(config.internvl_config)
         self.projector = GptVOssProjector(config)
-        self.oss_language_model = AutoModel.from_config(config.text_config)
-        # hardy: for weight merging only
-        # self.oss_language_model = AutoModelForCausalLM.from_config(config.text_config)
+        if getattr(config, 'model_merging', False):
+            # hardy: for weight merging only
+            self.oss_language_model = AutoModelForCausalLM.from_config(config.text_config)
+        else:
+            self.oss_language_model = AutoModel.from_config(config.text_config)
 
         self.post_init()
 
