@@ -13,6 +13,7 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ..auto import AutoModel, AutoModelForCausalLM
 from .configuration_gpt_v_oss2 import GptVOss2Config
 
+import pdb
 
 class GptVOss2Projector(nn.Module):
     def __init__(self, config: GptVOss2Config):
@@ -43,8 +44,14 @@ class GptVOss2Model(GptVOss2PreTrainedModel):
         self.vision_language_model = AutoModel.from_config(config.internvl_config)
         self.projector = GptVOss2Projector(config)
         self.oss_language_model = AutoModel.from_config(config.text_config)
-        # hardy: for weight merging only
-        # self.oss_language_model = AutoModelForCausalLM.from_config(config.text_config)
+
+        if getattr(config, 'model_merging', False):
+            # hardy: for weight merging only
+            print(f'Performing model merging!!!!! This shouldn\'t happen at training!')
+            pdb.set_trace()
+            self.oss_language_model = AutoModelForCausalLM.from_config(config.text_config)
+        else:
+            self.oss_language_model = AutoModel.from_config(config.text_config)
 
         self.post_init()
 
@@ -205,39 +212,52 @@ class GptVOss2Model(GptVOss2PreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, MoeModelOutputWithPast]:        
-        # replace image tokens in input_ids with lang_token
-        input_ids_for_vl_model, attention_mask_for_vl_model, vision_mask = self.reverse_and_gather_vision_tokens(input_ids)
-        
-        # image only
-        vision_outputs = self.vision_language_model(
-            input_ids=input_ids_for_vl_model,
-            pixel_values=pixel_values,
-            attention_mask=attention_mask_for_vl_model, # all ones
-            **kwargs,
-        )
+    ) -> Union[tuple, MoeModelOutputWithPast]:    
 
-        # this is a padded tensor!
-        vision_feature = self.projector(vision_outputs.last_hidden_state)
-        # unpadded list[tensor]
-        vision_feature_unpadded_lst = self.unpad_tensor(vision_feature, attention_mask_for_vl_model)
-        
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
         # get oss emb
-        input_embeds = self.get_input_embeddings()(input_ids)
-        
-        # scatter image feature to input_embeddings
-        hidden_states = self.scatter_sources_into_target(
-            sources=vision_feature_unpadded_lst,
-            target=input_embeds,
-            mask=vision_mask
-        )
+        if inputs_embeds is None:
+            input_embeds = self.get_input_embeddings()(input_ids)
 
+
+        # pdb.set_trace()
+        inputs_embeds; pixel_values
+
+        if pixel_values is not None:
+            # replace image tokens in input_ids with lang_token
+            input_ids_for_vl_model, attention_mask_for_vl_model, vision_mask = self.reverse_and_gather_vision_tokens(input_ids)
+        
+            # get image features
+            vision_outputs = self.vision_language_model(
+                input_ids=input_ids_for_vl_model,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask_for_vl_model, # all ones
+                # **kwargs,
+            )
+
+            # this is a padded tensor!
+            vision_feature = self.projector(vision_outputs.last_hidden_state)
+            # unpadded list[tensor]
+            vision_feature_unpadded_lst = self.unpad_tensor(vision_feature, attention_mask_for_vl_model)
+        
+
+            # scatter image feature to input_embeddings
+            input_embeds = self.scatter_sources_into_target(
+                sources=vision_feature_unpadded_lst,
+                target=input_embeds,
+                mask=vision_mask
+            )
+        
         # forward language model
+        # cache handled inside
         outputs = self.oss_language_model(
+            input_ids=None,
             attention_mask=attention_mask,
             position_ids=position_ids, 
             past_key_values=past_key_values,
-            inputs_embeds=hidden_states,
+            inputs_embeds=input_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -287,10 +307,14 @@ class GptVOss2ForConditionalGeneration(GptVOss2PreTrainedModel, GenerationMixin)
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, MoeCausalLMOutputWithPast]:
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.text_config.output_router_logits
+        )
         outputs: MoeModelOutputWithPast = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -303,6 +327,7 @@ class GptVOss2ForConditionalGeneration(GptVOss2PreTrainedModel, GenerationMixin)
             output_hidden_states=output_hidden_states,
             return_dict=True,
             cache_position=cache_position,
+            output_router_logits=output_router_logits,
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
@@ -322,5 +347,47 @@ class GptVOss2ForConditionalGeneration(GptVOss2PreTrainedModel, GenerationMixin)
             router_logits=getattr(outputs, "router_logits", None),
         )
 
+
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        second_per_grid_ts=None,
+        **kwargs,
+    ):
+        # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
+
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            position_ids=position_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+        # pdb.set_trace()
+        if cache_position[0] != 0:
+            model_inputs["pixel_values"] = None
+            model_inputs["pixel_values_videos"] = None
+
+        return model_inputs
 
 __all__ = ["GptVOss2Model", "GptVOss2ForConditionalGeneration", "GptVOss2PreTrainedModel"]
