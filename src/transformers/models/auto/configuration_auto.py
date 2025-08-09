@@ -1299,7 +1299,7 @@ class AutoConfig:
         )
 
     @staticmethod
-    def register(model_type, config, exist_ok=False) -> None:
+    def register(model_type, config, exist_ok=True) -> None:
         """
         Register a new configuration for this class.
 
